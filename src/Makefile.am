@@ -31,22 +31,27 @@ hashpipe_exec = hashpipe.c             \
 bin_PROGRAMS += hashpipe_check_databuf
 hashpipe_check_databuf_SOURCES = hashpipe_check_databuf.c
 hashpipe_check_databuf_LDADD = libhashpipe.la libhashpipestatus.la
+hashpipe_check_databuf_LDFLAGS = -Wl,-rpath,"$(libdir)"
 
 bin_PROGRAMS += hashpipe_check_status
 hashpipe_check_status_SOURCES = hashpipe_check_status.c
 hashpipe_check_status_LDADD = libhashpipestatus.la
+hashpipe_check_status_LDFLAGS = -Wl,-rpath,"$(libdir)"
 
 bin_PROGRAMS += hashpipe_clean_shmem
 hashpipe_clean_shmem_SOURCES = hashpipe_clean_shmem.c
 hashpipe_clean_shmem_LDADD = libhashpipe.la libhashpipestatus.la
+hashpipe_clean_shmem_LDFLAGS = -Wl,-rpath,"$(libdir)"
 
 bin_PROGRAMS += hashpipe_dump_databuf
 hashpipe_dump_databuf_SOURCES = hashpipe_dump_databuf.c
 hashpipe_dump_databuf_LDADD = libhashpipe.la
+hashpipe_dump_databuf_LDFLAGS = -Wl,-rpath,"$(libdir)"
 
 bin_PROGRAMS += hashpipe_write_databuf
 hashpipe_write_databuf_SOURCES = hashpipe_write_databuf.c
 hashpipe_write_databuf_LDADD = libhashpipe.la
+hashpipe_write_databuf_LDFLAGS = -Wl,-rpath,"$(libdir)"
 
 bin_PROGRAMS += hashpipe
 hashpipe_SOURCES = $(hashpipe_exec)
