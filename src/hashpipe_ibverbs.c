@@ -250,7 +250,7 @@ clean_devlist:
 // TODO Create checksum calculating functions as backup
 int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
 {
-  int i;
+  int i, ii, j;
   int flags;
   int errsv;
   int send_flags = 0;
@@ -272,6 +272,11 @@ int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
     errno = EINVAL;
     perror("hashpipe_ibv_context(NULL)");
     return -1;
+  }
+
+  // Must have at least one QP
+  if(hibv_ctx->nqp == 0) {
+    hibv_ctx->nqp = 1;
   }
 
   // Sanity check user provided buffers
@@ -354,6 +359,24 @@ int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
     return 1;
   }
 
+  // Use max wr per QP if send_pkt_num or recv_pkt_num is 0
+  if(hibv_ctx->send_pkt_num == 0) {
+    if(hibv_ctx->user_managed_flag) {
+      errno = EINVAL;
+      perror("must specify non-zero send_pkt_num with user managed buffers");
+      goto cleanup_and_return_error;
+    }
+    hibv_ctx->send_pkt_num = hibv_ctx->dev_attr.max_qp_wr;
+  }
+  if(hibv_ctx->recv_pkt_num == 0) {
+    if(hibv_ctx->user_managed_flag) {
+      errno = EINVAL;
+      perror("must specify non-zero recv_pkt_num with user managed buffers");
+      goto cleanup_and_return_error;
+    }
+    hibv_ctx->recv_pkt_num = hibv_ctx->dev_attr.max_qp_wr;
+  }
+
   // Create protection domain (aka PD)
   if(!(hibv_ctx->pd = ibv_alloc_pd(hibv_ctx->ctx))) {
     perror("ibv_alloc_pd");
@@ -388,12 +411,19 @@ int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
     goto cleanup_and_return_error;
   }
 
-  // Create send completion queue
-  // TODO comp_vector: what is it good for???  Set to 0 (for now)
-  if(!(hibv_ctx->send_cq = IBV_CREATE_CQ(hibv_ctx->ctx,
-          hibv_ctx->send_pkt_num, NULL, hibv_ctx->send_cc, 0, &cq_attr))) {
-    perror("ibv_create_cq[send]");
+  // Create send completion queues
+  if(!(hibv_ctx->send_cq =
+        (struct ibv_cq **)calloc(hibv_ctx->nqp, sizeof(struct ibv_cq *)))) {
+    perror("malloc send_cq array");
     goto cleanup_and_return_error;
+  }
+  for(i=0; i<hibv_ctx->nqp; i++) {
+    if(!(hibv_ctx->send_cq[i] = IBV_CREATE_CQ(hibv_ctx->ctx,
+            hibv_ctx->send_pkt_num, (void *)(uintptr_t)i,
+            hibv_ctx->send_cc, 0, &cq_attr))) {
+      perror("ibv_create_cq[send]");
+      goto cleanup_and_return_error;
+    }
   }
 
 #if HPIBV_USE_SEND_CC
@@ -405,40 +435,46 @@ int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
   }
 #endif
 
-  // Create recv completion queue
-  if(!(hibv_ctx->recv_cq = IBV_CREATE_CQ(hibv_ctx->ctx,
-          hibv_ctx->recv_pkt_num, NULL, hibv_ctx->recv_cc, 0, &cq_attr))) {
-    perror("ibv_create_cq[recv]");
+  // Create recv completion queues
+  if(!(hibv_ctx->recv_cq =
+        (struct ibv_cq **)calloc(hibv_ctx->nqp, sizeof(struct ibv_cq *)))) {
+    perror("malloc recv_cq array");
     goto cleanup_and_return_error;
   }
+  for(i=0; i<hibv_ctx->nqp; i++) {
+    if(!(hibv_ctx->recv_cq[i] = IBV_CREATE_CQ(hibv_ctx->ctx,
+            hibv_ctx->recv_pkt_num, (void *)(uintptr_t)i,
+            hibv_ctx->recv_cc, 0, &cq_attr))) {
+      perror("ibv_create_cq[recv]");
+      goto cleanup_and_return_error;
+    }
 
-  // Request notifications before any receive completion can be created.
-  // Do NOT restrict to solicited-only completions for receive.
-  if(ibv_req_notify_cq(hibv_ctx->recv_cq, 0)) {
-    perror("ibv_req_notify_cq[recv]");
-    goto cleanup_and_return_error;
+    // Request notifications before any receive completion can be created.
+    // Do NOT restrict to solicited-only completions for receive.
+    if(ibv_req_notify_cq(hibv_ctx->recv_cq[i], 0)) {
+      perror("ibv_req_notify_cq[recv]");
+      goto cleanup_and_return_error;
+    }
   }
 
   // For user managed work requests, walk lists to get max sge
   if(hibv_ctx->user_managed_flag) {
-    for(i=0; i<hibv_ctx->send_pkt_num; i++) {
+    for(i=0; i<hibv_ctx->send_pkt_num*hibv_ctx->nqp; i++) {
       if(max_send_sge < hibv_ctx->send_pkt_buf[i].wr.num_sge) {
         max_send_sge = hibv_ctx->send_pkt_buf[i].wr.num_sge;
       }
     }
 
-    for(i=0; i<hibv_ctx->recv_pkt_num; i++) {
+    for(i=0; i<hibv_ctx->recv_pkt_num*hibv_ctx->nqp; i++) {
       if(max_recv_sge < hibv_ctx->recv_pkt_buf[i].wr.num_sge) {
         max_recv_sge = hibv_ctx->recv_pkt_buf[i].wr.num_sge;
       }
     }
   }
 
-  // Create queue pair (aka QP, starts in RESET state)
+  // Create queue pairs (aka QP, starts in RESET state)
   struct ibv_qp_init_attr ibv_qp_init_attr = {
     .qp_context = NULL,
-    .send_cq = hibv_ctx->send_cq,
-    .recv_cq = hibv_ctx->recv_cq,
     .srq = NULL,
     .cap = {
       .max_send_wr = hibv_ctx->send_pkt_num,
@@ -448,82 +484,125 @@ int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
       .max_inline_data = 0,
     },
     .qp_type = IBV_QPT_RAW_PACKET,
-    .sq_sig_all = 0
+    .sq_sig_all = 1
   };
 
-  if(!(hibv_ctx->qp = ibv_create_qp(hibv_ctx->pd, &ibv_qp_init_attr))) {
-    perror("ibv_create_qp");
+  if(!(hibv_ctx->qp =
+        (struct ibv_qp **)calloc(hibv_ctx->nqp, sizeof(struct ibv_qp *)))) {
+    perror("malloc qp array");
     goto cleanup_and_return_error;
   }
 
-  // Transition QP to INIT state
-  struct ibv_qp_attr ibv_qp_attr = {
-    .qp_state = IBV_QPS_INIT,
-    .port_num = hibv_ctx->port_num // NIC port (1 or 2 for dual port NIC)
-  };
+  for(i=0; i<hibv_ctx->nqp; i++) {
+    ibv_qp_init_attr.send_cq = hibv_ctx->send_cq[i];
+    ibv_qp_init_attr.recv_cq = hibv_ctx->recv_cq[i];
+    if(!(hibv_ctx->qp[i] = ibv_create_qp(hibv_ctx->pd, &ibv_qp_init_attr))) {
+      perror("ibv_create_qp");
+      goto cleanup_and_return_error;
+    }
 
-  if(ibv_modify_qp(hibv_ctx->qp, &ibv_qp_attr, IBV_QP_STATE|IBV_QP_PORT)) {
-    perror("ibv_modify_qp[init]");
-    goto cleanup_and_return_error;
+    // Transition QP to INIT state
+    struct ibv_qp_attr ibv_qp_attr = {
+      .qp_state = IBV_QPS_INIT,
+      .port_num = hibv_ctx->port_num // NIC port (1 or 2 for dual port NIC)
+    };
+
+    if(ibv_modify_qp(hibv_ctx->qp[i], &ibv_qp_attr, IBV_QP_STATE|IBV_QP_PORT)) {
+      perror("ibv_modify_qp[init]");
+      goto cleanup_and_return_error;
+    }
   }
 
   // Allocate buffers (unless user managed)
   if(!hibv_ctx->user_managed_flag) {
     if(!(hibv_ctx->send_pkt_buf = (struct hashpipe_ibv_send_pkt *)
-          calloc(hibv_ctx->send_pkt_num,
+          calloc(hibv_ctx->send_pkt_num * hibv_ctx->nqp,
             sizeof(struct hashpipe_ibv_send_pkt)))) {
       perror("calloc(hashpipe_ibv_send_pkt)");
       goto cleanup_and_return_error;
     }
+#if 0
+    if(mlock(hibv_ctx->send_pkt_buf, sizeof(struct hashpipe_ibv_send_pkt) *
+          hibv_ctx->send_pkt_num * hibv_ctx->nqp)) {
+      perror("mlock(send_pkt_buf)");
+      goto cleanup_and_return_error;
+    }
+#endif
     if(!(hibv_ctx->recv_pkt_buf = (struct hashpipe_ibv_recv_pkt *)
-          calloc(hibv_ctx->recv_pkt_num,
+          calloc(hibv_ctx->recv_pkt_num * hibv_ctx->nqp,
             sizeof(struct hashpipe_ibv_recv_pkt)))) {
       perror("calloc(hashpipe_ibv_recv_pkt)");
       goto cleanup_and_return_error;
     }
+#if 0
+    if(mlock(hibv_ctx->recv_pkt_buf, sizeof(struct hashpipe_ibv_recv_pkt) *
+          hibv_ctx->recv_pkt_num * hibv_ctx->nqp)) {
+      perror("mlock(recv_pkt_buf)");
+      goto cleanup_and_return_error;
+    }
+#endif
     if(!(hibv_ctx->send_sge_buf = (struct ibv_sge *)
-          calloc(hibv_ctx->send_pkt_num, sizeof(struct ibv_sge)))) {
+          calloc(hibv_ctx->send_pkt_num * hibv_ctx->nqp,
+            sizeof(struct ibv_sge)))) {
       perror("calloc(ibv_send_sge)");
       goto cleanup_and_return_error;
     }
+#if 0
+    if(mlock(hibv_ctx->send_sge_buf, sizeof(struct ibv_sge) *
+          hibv_ctx->send_pkt_num * hibv_ctx->nqp)) {
+      perror("mlock(send_sge_buf)");
+      goto cleanup_and_return_error;
+    }
+#endif
     if(!(hibv_ctx->recv_sge_buf = (struct ibv_sge *)
-          calloc(hibv_ctx->recv_pkt_num, sizeof(struct ibv_sge)))) {
+          calloc(hibv_ctx->recv_pkt_num * hibv_ctx->nqp,
+            sizeof(struct ibv_sge)))) {
       perror("calloc(ibv_recv_sge)");
       goto cleanup_and_return_error;
     }
+#if 0
+    if(mlock(hibv_ctx->recv_sge_buf, sizeof(struct ibv_sge) *
+          hibv_ctx->recv_pkt_num * hibv_ctx->nqp)) {
+      perror("mlock(recv_sge_buf)");
+      goto cleanup_and_return_error;
+    }
+#endif
+
+    hibv_ctx->send_mr_size =
+      (size_t)hibv_ctx->send_pkt_num * hibv_ctx->pkt_size_max * hibv_ctx->nqp;
+
+    hibv_ctx->recv_mr_size =
+      (size_t)hibv_ctx->recv_pkt_num * hibv_ctx->pkt_size_max * hibv_ctx->nqp;
+
 #if HPIBV_USE_MMAP_PKTBUFS
-    if((hibv_ctx->send_mr_buf = (uint8_t *)mmap(NULL,
-            hibv_ctx->send_pkt_num*hibv_ctx->pkt_size_max,
-            PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS,
+    if((hibv_ctx->send_mr_buf = (uint8_t *)mmap(NULL, hibv_ctx->send_mr_size,
+            PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_LOCKED,
             -1, 0)) == MAP_FAILED) {
       perror("mmap(send_mr_buf)");
       goto cleanup_and_return_error;
     }
-    if(mlock(hibv_ctx->send_mr_buf,
-          hibv_ctx->send_pkt_num*hibv_ctx->pkt_size_max)) {
+    if(mlock(hibv_ctx->send_mr_buf, hibv_ctx->send_mr_size)) {
       perror("mlock(send_mr_buf)");
       goto cleanup_and_return_error;
     }
-    if((hibv_ctx->recv_mr_buf = (uint8_t *)mmap(NULL,
-            hibv_ctx->recv_pkt_num*hibv_ctx->pkt_size_max,
-            PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS,
+    if((hibv_ctx->recv_mr_buf = (uint8_t *)mmap(NULL, hibv_ctx->recv_mr_size,
+            PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_LOCKED,
             -1, 0)) == MAP_FAILED) {
       perror("mmap(recv_mr_buf)");
       goto cleanup_and_return_error;
     }
-    if(mlock(hibv_ctx->recv_mr_buf,
-          hibv_ctx->recv_pkt_num*hibv_ctx->pkt_size_max)) {
+    if(mlock(hibv_ctx->recv_mr_buf, hibv_ctx->recv_mr_size)) {
       perror("mlock(recv_mr_buf)");
       goto cleanup_and_return_error;
     }
 #else
     if(!(hibv_ctx->send_mr_buf = (uint8_t *)
-          calloc(hibv_ctx->send_pkt_num, hibv_ctx->pkt_size_max))) {
+          calloc(1, hibv_ctx->send_mr_size))) {
       perror("calloc(ibv_send_mr)");
       goto cleanup_and_return_error;
     }
     if(!(hibv_ctx->recv_mr_buf = (uint8_t *)
-          calloc(hibv_ctx->recv_pkt_num, hibv_ctx->pkt_size_max))) {
+          calloc(1, hibv_ctx->recv_mr_size))) {
       perror("calloc(ibv_recv_mr)");
       goto cleanup_and_return_error;
     }
@@ -532,44 +611,90 @@ int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
 
   // Register send and receive memory regions
   if(!(hibv_ctx->send_mr = ibv_reg_mr(hibv_ctx->pd, hibv_ctx->send_mr_buf,
-          hibv_ctx->send_pkt_num * hibv_ctx->pkt_size_max, 0))) {
+          hibv_ctx->send_mr_size, 0))) {
     perror("ibv_reg_mr[send]");
     goto cleanup_and_return_error;
   }
 
+#if 1
   if(!(hibv_ctx->recv_mr = ibv_reg_mr(hibv_ctx->pd, hibv_ctx->recv_mr_buf,
-          hibv_ctx->recv_pkt_num * hibv_ctx->pkt_size_max,
+          hibv_ctx->recv_mr_size,
           IBV_ACCESS_LOCAL_WRITE))) {
     perror("ibv_reg_mr[recv]");
+    fprintf(stderr, "addr %p length %lu\n",
+        hibv_ctx->recv_mr_buf, hibv_ctx->recv_mr_size);
     goto cleanup_and_return_error;
   }
+#else
+  struct ibv_exp_reg_mr_in mr_info = {
+    .pd = hibv_ctx->pd,
+    .addr = hibv_ctx->recv_mr_buf,
+    .length = hibv_ctx->recv_mr_size,
+    .exp_access = IBV_EXP_ACCESS_LOCAL_WRITE,
+    .comp_mask = 0
+  };
+  if(!(hibv_ctx->recv_mr = ibv_exp_reg_mr(&mr_info))) {
+    perror("ibv_exp_reg_mr[recv]");
+    fprintf(stderr, "addr %p length %lu\n",
+        hibv_ctx->recv_mr_buf, hibv_ctx->recv_mr_size);
+    goto cleanup_and_return_error;
+  }
+#endif
 
-  // Initialize work requests and scatter/gather elements unless user managed.
-  if(!hibv_ctx->user_managed_flag) {
-    // Send related elements
-    for(i=0; i<hibv_ctx->send_pkt_num; i++) {
-      hibv_ctx->send_pkt_buf[i].wr.wr_id = i;
-      hibv_ctx->send_pkt_buf[i].wr.sg_list = &hibv_ctx->send_sge_buf[i];
+  // Initialize work requests and scatter/gather fields
+  //
+  // For user managed buffers, the `num_sge` field of the work requests (WRs)
+  // and the `addr` and `length` fields of the scatter-gather elements (SGEs)
+  // must be set by the user.  Note that the library will enforce a wr_id
+  // scheme that sets the wr_id to the index of the WR element in the WR array.
+  //
+  // Send related elements
+  for(i=0; i<hibv_ctx->send_pkt_num*hibv_ctx->nqp; i++) {
+    hibv_ctx->send_pkt_buf[i].wr.wr_id = i;
+
+    if(!hibv_ctx->user_managed_flag) {
       hibv_ctx->send_pkt_buf[i].wr.num_sge = 1;
 
       hibv_ctx->send_sge_buf[i].addr = (uint64_t)
         hibv_ctx->send_mr_buf + i * hibv_ctx->pkt_size_max;
       hibv_ctx->send_sge_buf[i].length = hibv_ctx->pkt_size_max;
-      hibv_ctx->send_sge_buf[i].lkey = hibv_ctx->send_mr->lkey;
-    }
+    } // !user_managed
 
-    // Receive related elements
-    for(i=0; i<hibv_ctx->recv_pkt_num; i++) {
-      hibv_ctx->recv_pkt_buf[i].wr.wr_id = i;
-      hibv_ctx->recv_pkt_buf[i].wr.sg_list = &hibv_ctx->recv_sge_buf[i];
+    if(i == 0) {
+      hibv_ctx->send_pkt_buf[i].wr.sg_list = &hibv_ctx->send_sge_buf[0];
+    } else {
+      hibv_ctx->send_pkt_buf[i].wr.sg_list =
+        hibv_ctx->send_pkt_buf[i-1].wr.sg_list +
+        hibv_ctx->send_pkt_buf[i-1].wr.num_sge;
+    }
+    for(j=0; j<hibv_ctx->send_pkt_buf[i].wr.num_sge; j++) {
+      hibv_ctx->send_pkt_buf[i].wr.sg_list[j].lkey = hibv_ctx->send_mr->lkey;
+    }
+  }
+
+  // Receive related elements
+  for(i=0; i<hibv_ctx->recv_pkt_num*hibv_ctx->nqp; i++) {
+    hibv_ctx->recv_pkt_buf[i].wr.wr_id = i;
+
+    if(!hibv_ctx->user_managed_flag) {
       hibv_ctx->recv_pkt_buf[i].wr.num_sge = 1;
 
       hibv_ctx->recv_sge_buf[i].addr = (uint64_t)
         hibv_ctx->recv_mr_buf + i * hibv_ctx->pkt_size_max;
       hibv_ctx->recv_sge_buf[i].length = hibv_ctx->pkt_size_max;
-      hibv_ctx->recv_sge_buf[i].lkey = hibv_ctx->recv_mr->lkey;
+    } // !user_managed
+
+    if(i == 0) {
+      hibv_ctx->recv_pkt_buf[i].wr.sg_list = &hibv_ctx->recv_sge_buf[0];
+    } else {
+      hibv_ctx->recv_pkt_buf[i].wr.sg_list =
+        hibv_ctx->recv_pkt_buf[i-1].wr.sg_list +
+        hibv_ctx->recv_pkt_buf[i-1].wr.num_sge;
     }
-  } // !user_managed
+    for(j=0; j<hibv_ctx->recv_pkt_buf[i].wr.num_sge; j++) {
+      hibv_ctx->recv_pkt_buf[i].wr.sg_list[j].lkey = hibv_ctx->recv_mr->lkey;
+    }
+  }
 
 // Mellanox installed infiniband/verbs.h file does not define
 // IBV_DEVICE_IP_CSUM or IBV_SEND_IP_CSUM.
@@ -581,25 +706,30 @@ int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
   }
 #endif // HAVE_IBV_IP_CSUM
 
-  // Link send work requests and set head pointer
-  for(i=0; i<hibv_ctx->send_pkt_num; i++) {
-    hibv_ctx->send_pkt_buf[i].wr.next = (i < hibv_ctx->send_pkt_num-1)
-                                      ? &hibv_ctx->send_pkt_buf[i+1].wr
-                                      : NULL;
+  // Link/initialize send work requests
+  for(i=0; i<hibv_ctx->send_pkt_num*hibv_ctx->nqp-1; i++) {
+    hibv_ctx->send_pkt_buf[i].wr.next = &hibv_ctx->send_pkt_buf[i+1].wr;
     hibv_ctx->send_pkt_buf[i].wr.opcode = IBV_WR_SEND;
     hibv_ctx->send_pkt_buf[i].wr.send_flags = send_flags;
   }
+  // Initialize last element
+  hibv_ctx->send_pkt_buf[i].wr.next = NULL;
+  hibv_ctx->send_pkt_buf[i].wr.opcode = IBV_WR_SEND;
+  hibv_ctx->send_pkt_buf[i].wr.send_flags = send_flags;
+  // Set head pointer
   hibv_ctx->send_pkt_head = hibv_ctx->send_pkt_buf;
 
-  // Unlink recv work requests
-  for(i=0; i<hibv_ctx->recv_pkt_num; i++) {
-    hibv_ctx->recv_pkt_buf[i].wr.next = NULL;
-  }
+  // Link recv work requests
+  for(i=0; i<hibv_ctx->nqp; i++) {
+    ii = i*hibv_ctx->recv_pkt_num;
+    for(j=0; j<hibv_ctx->recv_pkt_num-1; j++) {
+      hibv_ctx->recv_pkt_buf[ii+j].wr.next = &hibv_ctx->recv_pkt_buf[ii+j+1].wr;
+    }
+    hibv_ctx->recv_pkt_buf[ii+j].wr.next = NULL;
 
-  // Post receive work requests
-  for(i=0; i<hibv_ctx->recv_pkt_num; i++) {
-    if(ibv_post_recv(hibv_ctx->qp,
-          &hibv_ctx->recv_pkt_buf[i].wr, &recv_wr_bad)) {
+    // Post receive work requests
+    if(ibv_post_recv(hibv_ctx->qp[i],
+          &hibv_ctx->recv_pkt_buf[ii].wr, &recv_wr_bad)) {
       perror("ibv_post_recv");
       goto cleanup_and_return_error;
     }
@@ -610,7 +740,7 @@ int hashpipe_ibv_init(struct hashpipe_ibv_context * hibv_ctx)
     hibv_ctx->max_flows = 1;
   }
   if(!(hibv_ctx->ibv_flows = (struct ibv_flow **)
-        calloc(hibv_ctx->max_flows, sizeof(struct ibv_flow *)))) {
+        calloc(hibv_ctx->max_flows*hibv_ctx->nqp, sizeof(struct ibv_flow *)))) {
     perror("calloc(ibv_flows)");
     goto cleanup_and_return_error;
   }
@@ -656,14 +786,16 @@ int hashpipe_ibv_shutdown(struct hashpipe_ibv_context * hibv_ctx)
 
   if(hibv_ctx->ibv_flows) {
     // Destroy any flow rules
-    for(i=0; i<hibv_ctx->max_flows; i++) {
+    for(i=0; i<hibv_ctx->max_flows*hibv_ctx->nqp; i++) {
       if(hibv_ctx->ibv_flows[i]) {
-        // Drop multicast membership (if any)
-        if(hashpipe_ibv_mcast_membership(hibv_ctx, IP_DROP_MEMBERSHIP,
-              hibv_ctx->flow_dst_ips[i])) {
-          rc++;
-        } else {
-          hibv_ctx->flow_dst_ips[i] = 0;
+        if(i < hibv_ctx->max_flows) {
+          // Drop multicast membership (if any)
+          if(hashpipe_ibv_mcast_membership(hibv_ctx, IP_DROP_MEMBERSHIP,
+                hibv_ctx->flow_dst_ips[i])) {
+            rc++;
+          } else {
+            hibv_ctx->flow_dst_ips[i] = 0;
+          }
         }
 
         // Destroy flow
@@ -689,23 +821,38 @@ int hashpipe_ibv_shutdown(struct hashpipe_ibv_context * hibv_ctx)
   }
   hibv_ctx->recv_mr = NULL;
 
-  if(hibv_ctx->qp && ibv_destroy_qp(hibv_ctx->qp)) {
-    perror("ibv_destroy_qp");
-    rc++;
+  if(hibv_ctx->qp) {
+    for(i=0; i<hibv_ctx->nqp; i++) {
+      if(hibv_ctx->qp[i] && ibv_destroy_qp(hibv_ctx->qp[i])) {
+        perror("ibv_destroy_qp");
+        rc++;
+      }
+    }
+    free(hibv_ctx->qp);
+    hibv_ctx->qp = NULL;
   }
-  hibv_ctx->qp = NULL;
 
-  if(hibv_ctx->send_cq && ibv_destroy_cq(hibv_ctx->send_cq)) {
-    perror("ibv_destroy_cq[send]");
-    rc++;
+  if(hibv_ctx->send_cq) {
+    for(i=0; i<hibv_ctx->nqp; i++) {
+      if(hibv_ctx->send_cq[i] && ibv_destroy_cq(hibv_ctx->send_cq[i])) {
+        perror("ibv_destroy_cq[send]");
+        rc++;
+      }
+    }
+    free(hibv_ctx->send_cq);
+    hibv_ctx->send_cq = NULL;
   }
-  hibv_ctx->send_cq = NULL;
 
-  if(hibv_ctx->recv_cq && ibv_destroy_cq(hibv_ctx->recv_cq)) {
-    perror("ibv_destroy_cq[recv]");
-    rc++;
+  if(hibv_ctx->recv_cq) {
+    for(i=0; i<hibv_ctx->nqp; i++) {
+      if(hibv_ctx->recv_cq[i] && ibv_destroy_cq(hibv_ctx->recv_cq[i])) {
+        perror("ibv_destroy_cq[recv]");
+        rc++;
+      }
+    }
+    free(hibv_ctx->recv_cq);
+    hibv_ctx->recv_cq = NULL;
   }
-  hibv_ctx->recv_cq = NULL;
 
 #if HPIBV_USE_SEND_CC
   if(hibv_ctx->send_cc && ibv_destroy_comp_channel(hibv_ctx->send_cc)) {
@@ -805,6 +952,7 @@ int hashpipe_ibv_flow(
     uint32_t  src_ip,     uint32_t  dst_ip,
     uint16_t  src_port,   uint16_t  dst_port)
 {
+  int i, j;
   uint8_t mcast_dst_mac[ETH_ALEN];
   struct hashpipe_ibv_flow flow = {
     .attr = {
@@ -850,19 +998,22 @@ int hashpipe_ibv_flow(
     return 1;
   }
 
-  // If there is already a flow in the specified index, destroy it.
+  // If there is already a flow in the specified index, destroy it for each QP.
   if(hibv_ctx->ibv_flows[flow_idx]) {
-    // Drop multicast membership (if any)
+    // Drop multicast membership (if any) for first QP only
     if(hashpipe_ibv_mcast_membership(hibv_ctx, IP_DROP_MEMBERSHIP,
           hibv_ctx->flow_dst_ips[flow_idx])) {
       return 1;
     }
     hibv_ctx->flow_dst_ips[flow_idx] = 0;
 
-    if(ibv_destroy_flow(hibv_ctx->ibv_flows[flow_idx])) {
-      return 1;
+    for(i=0; i<hibv_ctx->nqp; i++) {
+      j = i*hibv_ctx->max_flows + flow_idx;
+      if(ibv_destroy_flow(hibv_ctx->ibv_flows[j])) {
+        return 1;
+      }
+      hibv_ctx->ibv_flows[j] = NULL;
     }
-    hibv_ctx->ibv_flows[flow_idx] = NULL;
   }
 
   // If no criteria are given, do nothing but return success
@@ -928,6 +1079,18 @@ int hashpipe_ibv_flow(
       if(dst_mac) {
         memcpy(flow.spec_eth.val.dst_mac, dst_mac, 6);
         memset(flow.spec_eth.mask.dst_mac, 0xff, 6);
+// Compile with ALLOW_IBV_WILDCARD_DST_MAC defined to allow unspecified (i.e.
+// widcard) dst_mac.  Doing so will make this incompatible with ConnectX-3.
+#ifndef ALLOW_IBV_WILDCARD_DST_MAC
+      } else {
+        fprintf(stderr, "using dst_mac ");
+        for(i=0; i<5; i++) {
+          fprintf(stderr, "%02x:", hibv_ctx->mac[i]);
+        }
+        fprintf(stderr, "%02x\n", hibv_ctx->mac[i]);
+        memcpy(flow.spec_eth.val.dst_mac, hibv_ctx->mac, 6);
+        memset(flow.spec_eth.mask.dst_mac, 0xff, 6);
+#endif
       }
 
       if(src_mac) {
@@ -951,9 +1114,14 @@ int hashpipe_ibv_flow(
       return 1;
   } // switch(flow_type)
 
-  if(!(hibv_ctx->ibv_flows[flow_idx] =
-        ibv_create_flow(hibv_ctx->qp, (struct ibv_flow_attr *)&flow))) {
-    return 1;
+  // Create flow for each QP
+  for(i=0; i<hibv_ctx->nqp; i++) {
+    j = i*hibv_ctx->max_flows + flow_idx;
+
+    if(!(hibv_ctx->ibv_flows[j] =
+          ibv_create_flow(hibv_ctx->qp[i], (struct ibv_flow_attr *)&flow))) {
+      return 1;
+    }
   }
 
   return 0;
@@ -970,15 +1138,15 @@ struct hashpipe_ibv_recv_pkt * hashpipe_ibv_recv_pkts(
   int num_wce;
   uint64_t wr_id;
   struct pollfd pfd;
+  struct ibv_qp *qp;
   struct ibv_qp_attr qp_attr;
   struct ibv_cq *ev_cq;
-  void * ev_cq_ctx;
+  int ev_cq_ctx;
 #if HPIBV_USE_EXP_CQ
   struct ibv_exp_wc wc[WC_BATCH_SIZE];
 #else
   struct ibv_wc wc[WC_BATCH_SIZE];
 #endif
-  struct ibv_recv_wr * recv_wr_bad;
   struct hashpipe_ibv_recv_pkt * recv_head = NULL;
   struct ibv_recv_wr * recv_tail = NULL;
 
@@ -989,29 +1157,32 @@ struct hashpipe_ibv_recv_pkt * hashpipe_ibv_recv_pkts(
     return NULL;
   }
 
-  // Ensure the QP state is suitable for receiving
-  switch(hibv_ctx->qp->state) {
-  case IBV_QPS_RESET: // Unexpected, but maybe user reset it
-    qp_attr.qp_state = IBV_QPS_INIT;
-    qp_attr.port_num = hibv_ctx->port_num;
-    if(ibv_modify_qp(hibv_ctx->qp, &qp_attr, IBV_QP_STATE|IBV_QP_PORT)) {
+  // Ensure the QPs are in a state suitable for receiving
+  for(i=0; i<hibv_ctx->nqp; i++) {
+    qp = hibv_ctx->qp[i];
+    switch(qp->state) {
+    case IBV_QPS_RESET: // Unexpected, but maybe user reset it
+      qp_attr.qp_state = IBV_QPS_INIT;
+      qp_attr.port_num = hibv_ctx->port_num;
+      if(ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE|IBV_QP_PORT)) {
+        return NULL;
+      }
+      // Fall through
+    case IBV_QPS_INIT:
+      qp_attr.qp_state = IBV_QPS_RTR;
+      if(ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE)) {
+        return NULL;
+      }
+      break;
+    case IBV_QPS_RTR:
+    case IBV_QPS_RTS:
+      // Already good to go
+      break;
+    default:
+      fprintf(stderr, "unexpected QP state %d\n", qp->state);
+      errno = EPROTO; // Protocol error
       return NULL;
     }
-    // Fall through
-  case IBV_QPS_INIT:
-    qp_attr.qp_state = IBV_QPS_RTR;
-    if(ibv_modify_qp(hibv_ctx->qp, &qp_attr, IBV_QP_STATE)) {
-      return NULL;
-    }
-    break;
-  case IBV_QPS_RTR:
-  case IBV_QPS_RTS:
-    // Already good to go
-    break;
-  default:
-    fprintf(stderr, "unexpected QP state %d\n", hibv_ctx->qp->state);
-    errno = EPROTO; // Protocol error
-    return NULL;
   }
 
   // Setup for poll
@@ -1028,7 +1199,7 @@ struct hashpipe_ibv_recv_pkt * hashpipe_ibv_recv_pkts(
   }
 
   // Get the completion event
-  if(ibv_get_cq_event(hibv_ctx->recv_cc, &ev_cq, &ev_cq_ctx)) {
+  if(ibv_get_cq_event(hibv_ctx->recv_cc, &ev_cq, (void **)&ev_cq_ctx)) {
     perror("ibv_get_cq_event");
     return NULL;
   }
@@ -1045,43 +1216,37 @@ struct hashpipe_ibv_recv_pkt * hashpipe_ibv_recv_pkts(
 
   // Empty the CQ: poll all of the completions from the CQ (if any exist)
   do {
-    // For now we poll the completion queue one completion at a time.
-    // Eventually we might want to poll for multiple completions per call.
     num_wce = IBV_POLL_CQ(ev_cq, WC_BATCH_SIZE, wc);
     if(num_wce < 0) {
       perror("ibv_poll_cq");
       return NULL;
     }
 
-    // Add work requests with success status to list
+    // Loop through all work completions
     for(i=0; i<num_wce; i++) {
+      wr_id = wc[i].wr_id;
+      // Set length to 0 for unsuccessful work requests
       if(wc[i].status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "got completion status 0x%x vendor error 0x%x\n",
-            wc[i].status, wc[i].vendor_err);
-        // Repost work request
-        if(ibv_post_recv(hibv_ctx->qp, &hibv_ctx->recv_pkt_buf[wc[i].wr_id].wr,
-              &recv_wr_bad)) {
-          perror("ibv_post_recv");
-          // Probably not going to end well if we get here,
-          // but we will soldier on anyway...
-        }
-        // Probably not going to end well if we get here either,
-        // but we will soldier on anyway...
+        fprintf(stderr,
+            "wr %lu (%#016lx) got completion status 0x%x (%s) vendor error 0x%x (QP %d)\n",
+            wr_id, wr_id, wc[i].status, ibv_wc_status_str(wc[i].status),
+            wc[i].vendor_err, ev_cq_ctx);
+        hibv_ctx->recv_pkt_buf[wr_id].length = 0;
       } else {
-        wr_id = wc[i].wr_id;
         // Copy byte_len from completion to length of pkt srtuct
         hibv_ctx->recv_pkt_buf[wr_id].length = wc[i].byte_len;
 #if HPIBV_USE_EXP_CQ
         hibv_ctx->recv_pkt_buf[wr_id].timestamp = wc[i].timestamp;
 #endif
-        if(!recv_head) {
-          recv_head = &hibv_ctx->recv_pkt_buf[wr_id];
-          recv_tail = &recv_head->wr;
-        } else {
-          recv_tail->next = &hibv_ctx->recv_pkt_buf[wr_id].wr;
-          recv_tail = recv_tail->next;
-        }
-      } // success
+      }
+      // Add work requests to recv list
+      if(!recv_head) {
+        recv_head = &hibv_ctx->recv_pkt_buf[wr_id];
+        recv_tail = &recv_head->wr;
+      } else {
+        recv_tail->next = &hibv_ctx->recv_pkt_buf[wr_id].wr;
+        recv_tail = recv_tail->next;
+      }
     } // for each work completion
   } while(num_wce);
 
@@ -1097,14 +1262,20 @@ struct hashpipe_ibv_recv_pkt * hashpipe_ibv_recv_pkts(
 int hashpipe_ibv_release_pkts(struct hashpipe_ibv_context * hibv_ctx,
     struct hashpipe_ibv_recv_pkt * recv_pkt)
 {
+  int i;
   struct ibv_recv_wr * recv_wr_bad;
 
-  if(!hibv_ctx || !recv_pkt) {
+  if(!hibv_ctx) {
     errno = EINVAL;
     return -1;
+  } else if(!recv_pkt) {
+    return 0;
   }
 
-  return ibv_post_recv(hibv_ctx->qp, &recv_pkt->wr, &recv_wr_bad);
+
+  // Figure out which QP these packets belong to and repost to that QP
+  i = recv_pkt->wr.wr_id / hibv_ctx->recv_pkt_num;
+  return ibv_post_recv(hibv_ctx->qp[i], &recv_pkt->wr, &recv_wr_bad);
 } // hashpipe_ibv_release_pkts
 
 #ifdef VERBOSE_IBV_DEBUG
@@ -1128,101 +1299,71 @@ static void print_send_pkt_list(struct hashpipe_ibv_send_pkt *p, size_t max)
 #endif // VERBOSE_IBV_DEBUG
 
 // Utility function to pop up to num_to_pop packets from the hibv_ctx's
-// send_pkt_head list, updating the send_pkt_head field as needed.  If *pp_head
-// is NULL, *pp_head will be updated to point to the head of the popped packets
-// (or NULL if no packets are available).  If *pp_tail is non-NULL, the popped
-// packets, if any, will be appended to **pp_tail and *pp_tail will be updated
-// to point to the new tail elmenent.  The number of packets popped will be
-// returned.  If hibv_ctx or pp_head or pp_tail is NULL, the number of packets
-// popped will be 0.  If *pp_tail is non-NULL and (*pp_tail)->wr.next is not
-// NULL (i.e. it does not point to a tail), the number of packets popped will
-// be 0.
-static size_t pop_send_packets(
-    struct hashpipe_ibv_context * hibv_ctx, size_t num_to_pop,
-    struct hashpipe_ibv_send_pkt ** pp_head,
-    struct hashpipe_ibv_send_pkt ** pp_tail)
+// send_pkt_head list, updating the send_pkt_head field as needed.
+// The return value is a pointer to the first packet of a linked list of
+// packets, or NULL if no packets are available or hibv_ctx is NULL or
+// num_to_pop is zero.
+static struct hashpipe_ibv_send_pkt * pop_send_packets(
+    struct hashpipe_ibv_context * hibv_ctx, size_t num_to_pop)
 {
-  size_t num_popped = 0;
+  int i;
+  struct hashpipe_ibv_send_pkt *head;
+  struct hashpipe_ibv_send_pkt *tail;
 
-  // Validate the hibv_ctx and pp_tail are non-NULL
-  if(!hibv_ctx || !pp_head || !pp_tail) {
+  // Validate that hibv_ctx is non-NULL
+  if(!hibv_ctx) {
     fprintf(stderr, "pop_send_packets: NULL pointer passwd\n");
-    return 0;
+    return NULL;
   }
 
 #ifdef VERBOSE_IBV_DEBUG
   eprintf("entering pop_send_packets for up to %lu packets\n", num_to_pop);
   eprintf("  pkt_head"); print_send_pkt_list(hibv_ctx->send_pkt_head, 32);
-  eprintf("  pop_head"); print_send_pkt_list(*pp_head, 32);
-  eprintf("  pop_tail"); print_send_pkt_list(*pp_tail, 32);
 #endif // VERBOSE_IBV_DEBUG
 
-  // Validate that *pp_tail, if non-NULL, points to a tail
-  if(*pp_tail && (*pp_tail)->wr.next) {
-    fprintf(stderr, "pop_send_packets: tail pointer points to non-tail\n");
-    return 0;
+  // If no packets requested or no packets are available, don't do anything
+  if(num_to_pop == 0 || !hibv_ctx->send_pkt_head) {
+    return NULL;
   }
 
-  // If no packets requested, don't do anything
-  if(num_to_pop == 0) {
-    return 0;
+  // Save head pointer
+  head = hibv_ctx->send_pkt_head;
+  // Walk tail down to last element (either the num_to_pop'th or the last
+  // element in the list, which ever happens first)
+  tail = hibv_ctx->send_pkt_head;
+  for(i=0; i<num_to_pop-1 && tail->wr.next; i++) {
+    tail = (struct hashpipe_ibv_send_pkt *)tail->wr.next;
   }
 
-  // If pp_head point to a NULL pointer, update it
-  if(!(*pp_head)) {
-    *pp_head = hibv_ctx->send_pkt_head;
-  }
-
-  // If pp_tail is non-NULL, append to existing tail
-  if(*pp_tail) {
-    (*pp_tail)->wr.next = &hibv_ctx->send_pkt_head->wr;
-  }
-
-  *pp_tail = hibv_ctx->send_pkt_head;
-  while(*pp_tail) {
-    // Increment num_popped
-    num_popped++;
-    // If we have enough packets or are at end of list, break out of loop
-    if(num_popped >= num_to_pop || !(*pp_tail)->wr.next) {
-      break;
-    }
-    *pp_tail = (struct hashpipe_ibv_send_pkt *)(*pp_tail)->wr.next;
-  }
-
-  // If *pp_tail is non-NULL, update send_pkt_head and sever popped packets
-  if(*pp_tail) {
-    hibv_ctx->send_pkt_head = (struct hashpipe_ibv_send_pkt *)(*pp_tail)->wr.next;
-    (*pp_tail)->wr.next = NULL;
-  }
+  // Update send_pkt_head and NULL terminate tail
+  hibv_ctx->send_pkt_head = (struct hashpipe_ibv_send_pkt *)tail->wr.next;
+  tail->wr.next = NULL;
 
 #ifdef VERBOSE_IBV_DEBUG
-  eprintf("leaving pop_send_packets got %lu packets\n", num_popped);
+  eprintf("leaving pop_send_packets got %d packets\n", i+1);
   eprintf("  pkt_head"); print_send_pkt_list(hibv_ctx->send_pkt_head, 32);
-  eprintf("  pop_head"); print_send_pkt_list(*pp_head, 32);
-  eprintf("  pop_tail"); print_send_pkt_list(*pp_tail, 32);
+  eprintf("  pop_head"); print_send_pkt_list(head, 32);
 #endif // VERBOSE_IBV_DEBUG
 
-  return num_popped;
+  // Done
+  return head;
 }
 
 // See comments in header file for details about this function.
 struct hashpipe_ibv_send_pkt * hashpipe_ibv_get_pkts(
-    struct hashpipe_ibv_context * hibv_ctx, uint32_t *num_pkts)
+    struct hashpipe_ibv_context * hibv_ctx, uint32_t num_pkts)
 {
-  int i;
+  int i, j;
   int num_wce;
-  size_t num_popped;
-  uint64_t wr_id_first;
-  uint64_t wr_id_last;
+  struct ibv_qp *qp;
   struct ibv_qp_attr qp_attr;
 #if HPIBV_USE_EXP_CQ
   struct ibv_exp_wc wc[WC_BATCH_SIZE];
 #else
   struct ibv_wc wc[WC_BATCH_SIZE];
 #endif
-  struct hashpipe_ibv_send_pkt * send_head = NULL;
-  struct hashpipe_ibv_send_pkt * send_tail = NULL;
-#if HPIBV_USE_TIMING_DAIGS
+  struct hashpipe_ibv_send_pkt * send_pkt;
+#if HPIBV_USE_TIMING_DIAGS
   struct timespec now;
 #endif
 
@@ -1236,120 +1377,108 @@ struct hashpipe_ibv_send_pkt * hashpipe_ibv_get_pkts(
 
   // Sanity check num_pkts
   // TODO Do we really want to check this each time?
-  if(*num_pkts > hibv_ctx->send_pkt_num) {
-    *num_pkts = hibv_ctx->send_pkt_num;
-  } else if(*num_pkts == 0) {
+  if(num_pkts > hibv_ctx->send_pkt_num) {
+    num_pkts = hibv_ctx->send_pkt_num;
+  } else if(num_pkts == 0) {
     return NULL;
   }
 
-  // Ensure the QP state is suitable for sending
+  // Ensure the QPs are in a state suitable for sending
   // TODO Do we really want to check this each time?
-if(hibv_ctx->qp->state != IBV_QPS_RTS) {
-  switch(hibv_ctx->qp->state) {
-  case IBV_QPS_RESET: // Unexpected, but maybe user reset it
-    qp_attr.qp_state = IBV_QPS_INIT;
-    qp_attr.port_num = hibv_ctx->port_num;
-    if(ibv_modify_qp(hibv_ctx->qp, &qp_attr, IBV_QP_STATE|IBV_QP_PORT)) {
-      return NULL;
+  for(i=0; i<hibv_ctx->nqp; i++) {
+    qp = hibv_ctx->qp[i];
+    if(qp->state != IBV_QPS_RTS) {
+      switch(qp->state) {
+      case IBV_QPS_RESET: // Unexpected, but maybe user reset it
+        qp_attr.qp_state = IBV_QPS_INIT;
+        qp_attr.port_num = hibv_ctx->port_num;
+        if(ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE|IBV_QP_PORT)) {
+          return NULL;
+        }
+        // Fall through
+      case IBV_QPS_INIT:
+        qp_attr.qp_state = IBV_QPS_RTR;
+        if(ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE)) {
+          return NULL;
+        }
+        // Fall through
+      case IBV_QPS_RTR:
+        qp_attr.qp_state = IBV_QPS_RTS;
+        if(ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE)) {
+          return NULL;
+        }
+        break;
+      case IBV_QPS_RTS:
+        // Already good to go
+        break;
+      default:
+        fprintf(stderr, "unexpected QP state %d\n", qp->state);
+        errno = EPROTO; // Protocol error
+        return NULL;
+      }
     }
-    // Fall through
-  case IBV_QPS_INIT:
-    qp_attr.qp_state = IBV_QPS_RTR;
-    if(ibv_modify_qp(hibv_ctx->qp, &qp_attr, IBV_QP_STATE)) {
-      return NULL;
-    }
-    // Fall through
-  case IBV_QPS_RTR:
-    qp_attr.qp_state = IBV_QPS_RTS;
-    if(ibv_modify_qp(hibv_ctx->qp, &qp_attr, IBV_QP_STATE)) {
-      return NULL;
-    }
-    break;
-  case IBV_QPS_RTS:
-    // Already good to go
-    break;
-  default:
-    fprintf(stderr, "unexpected QP state %d\n", hibv_ctx->qp->state);
-    errno = EPROTO; // Protocol error
-    return NULL;
   }
-}
+
+#if HPIBV_USE_TIMING_DIAGS
+  // Used to update elapsed stats of packets
+  clock_gettime(CLOCK_MONOTONIC, &now);
+#endif
 
   // Empty the CQ: poll all of the completions from the CQ (if any exist)
   // TODO Do we really want to do this each time?
-  do {
-    // For now we poll the completion queue one completion at a time.
-    // Eventually we might want to poll for multiple completions per call.
-    num_wce = IBV_POLL_CQ(hibv_ctx->send_cq, WC_BATCH_SIZE, wc);
-    if(num_wce < 0) {
-      perror("ibv_poll_cq");
-      return NULL;
-    }
-    eprintf("got %d work completions\n", num_wce);
+  for(i=0; i<hibv_ctx->nqp; i++) {
+    do {
+      num_wce = IBV_POLL_CQ(hibv_ctx->send_cq[i], WC_BATCH_SIZE, wc);
+      if(num_wce < 0) {
+        perror("ibv_poll_cq");
+        return NULL;
+      }
+      eprintf("got %d work completions for QP %d\n", num_wce, i);
 
-    // Process all completion events.
-    for(i=0; i<num_wce; i++) {
-      // Swap wr_id values from first/last send_pkt work requests
-      wr_id_first = wc[i].wr_id;
-      wr_id_last = hibv_ctx->send_pkt_buf[wr_id_first].wr.wr_id;
-      hibv_ctx->send_pkt_buf[wr_id_first].wr.wr_id = wr_id_first;
-      hibv_ctx->send_pkt_buf[wr_id_last].wr.wr_id = wr_id_last;
+      // Process all completion events.
+      for(j=0; j<num_wce; j++) {
+        send_pkt = &hibv_ctx->send_pkt_buf[wc[j].wr_id];
 #if HPIBV_USE_EXP_CQ
-      hibv_ctx->send_pkt_buf[wr_id_first].timestamp = wc[i].timestamp;
+        send_pkt->timestamp = wc[j].timestamp;
 #endif
-#if HPIBV_USE_TIMING_DAIGS
-      // Update elapsed stats of first send_pkt
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      hibv_ctx->send_pkt_buf[wr_id_first].elapsed_ns = ELAPSED_NS(
-          hibv_ctx->send_pkt_buf[wr_id_first].ts, now);
-      hibv_ctx->send_pkt_buf[wr_id_first].elapsed_ns_total +=
-          hibv_ctx->send_pkt_buf[wr_id_first].elapsed_ns;
-      hibv_ctx->send_pkt_buf[wr_id_first].elapsed_ns_count++;
+#if HPIBV_USE_TIMING_DIAGS
+        send_pkt->elapsed_ns = ELAPSED_NS( send_pkt->ts, now);
+        send_pkt->elapsed_ns_total += send_pkt->elapsed_ns;
+        send_pkt->elapsed_ns_count++;
 #endif
-      // Clear IBV_SEND_SIGNALED flag of tail element
-      hibv_ctx->send_pkt_buf[wr_id_last].wr.send_flags &= ~IBV_SEND_SIGNALED;
-      // Push onto send_pkt_head
-      hibv_ctx->send_pkt_buf[wr_id_last].wr.next =
-        &hibv_ctx->send_pkt_head->wr;
-      hibv_ctx->send_pkt_head = &hibv_ctx->send_pkt_buf[wr_id_first];
-      eprintf("got work completion for send work requests %lu to %lu\n",
-          wr_id_first, wr_id_last);
-    } // for each work completion
-  } while(num_wce);
-
-  num_popped = pop_send_packets(hibv_ctx, *num_pkts, &send_head, &send_tail);
-  *num_pkts = num_popped;
-  eprintf("popped %lu packets\n", num_popped);
-
-  // If we got any packets, ensure list is NULL terminated and that tail
-  // element has IBV_SEND_SIGNALED set and swap wr_id values from first and
-  // last packets.
-  if(send_tail) {
-    send_tail->wr.next = NULL;
-    send_tail->wr.send_flags |= IBV_SEND_SIGNALED;
-    wr_id_first = send_head->wr.wr_id;
-    send_head->wr.wr_id = send_tail->wr.wr_id;
-    send_tail->wr.wr_id = wr_id_first;
+        // Push onto send_pkt_head
+        send_pkt->wr.next = &hibv_ctx->send_pkt_head->wr;
+        hibv_ctx->send_pkt_head = send_pkt;
+        eprintf("got work completion for send work request %lu\n",
+            send_pkt->wr.wr_id);
+      } // for each work completion
+    } while(num_wce);
   }
 
-  return send_head;
+  return pop_send_packets(hibv_ctx, num_pkts);
 } // hashpipe_ibv_get_pkts
 
 // See comments in header file for details about this function.
 int hashpipe_ibv_send_pkts(struct hashpipe_ibv_context * hibv_ctx,
-    struct hashpipe_ibv_send_pkt * send_pkt)
+    struct hashpipe_ibv_send_pkt * send_pkt, uint32_t qp_idx)
 {
   //uint64_t wr_id;
   struct ibv_send_wr * p;
+#if HPIBV_USE_TIMING_DIAGS
+  struct hashpipe_ibv_send_pkt * pkt;
+#endif
 
-  if(!hibv_ctx || !send_pkt) {
+  if(!hibv_ctx || !send_pkt || qp_idx >= hibv_ctx->nqp) {
     errno = EINVAL;
     return -1;
   }
 
-#if HPIBV_USE_TIMING_DAIGS
-  clock_gettime(CLOCK_MONOTONIC, &send_pkt->ts);
+#if HPIBV_USE_TIMING_DIAGS
+  // Set ts field in each packet
+  for(pkt=send_pkt; pkt; pkt = pkt->wr.next) {
+    clock_gettime(CLOCK_MONOTONIC, &pkt->ts);
+  }
 #endif
 
-  return ibv_post_send(hibv_ctx->qp, &send_pkt->wr, &p);
+  return ibv_post_send(hibv_ctx->qp[qp_idx], &send_pkt->wr, &p);
 } // hashpipe_ibv_send_pkts
